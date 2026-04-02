@@ -5,8 +5,13 @@ import time
 from docx import Document as DocxDocument
 from io import BytesIO
 from ingestor import load_and_split, store_chunks
-from retriever import search_similar, check_relevance
-from llm import get_llm
+from retriever import search_similar, search_similar_filtered, check_relevance
+from llm import get_llm, call_llm_safe
+from evaluator import (
+    get_top_chunks_by_similarity,
+    compute_review_quality,
+    confidence_color,
+)
 
 st.set_page_config(
     page_title="LitMap",
@@ -52,302 +57,165 @@ st.markdown("""
         background: linear-gradient(135deg, #6366f1, #8b5cf6);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        display: flex;
-        align-items: center;
-        gap: 8px;
     }
-    .navbar-center {
-        font-size: 0.95rem;
-        color: #6b7280;
-        text-align: center;
-    }
-    .navbar-right {
-        width: 120px;
-    }
+    .navbar-center { font-size: 0.95rem; color: #6b7280; }
+    .navbar-right  { width: 120px; }
 
-    /* ── Welcome screen ── */
-    .hero {
-        text-align: center;
-        padding: 48px 16px 32px 16px;
-    }
+    /* ── Welcome ── */
+    .hero { text-align: center; padding: 48px 16px 32px 16px; }
     .hero-title {
-        font-size: 3rem;
-        font-weight: 700;
+        font-size: 3rem; font-weight: 700;
         background: linear-gradient(135deg, #6366f1, #8b5cf6, #06b6d4);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 8px;
-        line-height: 1.2;
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        margin-bottom: 8px; line-height: 1.2;
     }
-    .hero-sub {
-        font-size: 1rem;
-        color: #9ca3af;
-        margin-bottom: 32px;
-    }
+    .hero-sub { font-size: 1rem; color: #9ca3af; margin-bottom: 32px; }
     .chat-bubble {
         background: linear-gradient(135deg, #1e1b4b, #1e3a5f);
-        border: 1px solid #4f46e5;
-        border-radius: 16px;
-        padding: 20px 28px;
-        margin: 0 auto 32px auto;
-        max-width: 620px;
-        text-align: left;
+        border: 1px solid #4f46e5; border-radius: 16px;
+        padding: 20px 28px; margin: 0 auto 32px auto; max-width: 620px; text-align: left;
     }
-    .chat-bubble p {
-        color: #e2e8f0;
-        font-size: 0.95rem;
-        line-height: 1.7;
-        margin: 0 0 8px 0;
-    }
+    .chat-bubble p { color: #e2e8f0; font-size: 0.95rem; line-height: 1.7; margin: 0 0 8px 0; }
     .chat-bubble p:last-child { margin-bottom: 0; }
-
-    /* ── Form ── */
-    .form-label {
-        font-size: 1rem;
-        font-weight: 600;
-        color: #e2e8f0;
-        margin-bottom: 4px;
-    }
-    .form-sub {
-        font-size: 0.82rem;
-        color: #6b7280;
-        margin-bottom: 12px;
-    }
+    .form-label { font-size: 1rem; font-weight: 600; color: #e2e8f0; margin-bottom: 4px; }
+    .form-sub   { font-size: 0.82rem; color: #6b7280; margin-bottom: 12px; }
 
     /* ── Understand screen ── */
-    .understand-hero {
-        text-align: center;
-        padding: 40px 16px 24px 16px;
-    }
+    .understand-hero { text-align: center; padding: 40px 16px 24px 16px; }
     .understand-hero-title {
-        font-size: 2.2rem;
-        font-weight: 700;
+        font-size: 2.2rem; font-weight: 700;
         background: linear-gradient(135deg, #6366f1, #8b5cf6, #06b6d4);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         margin-bottom: 8px;
     }
-    .understand-hero-sub {
-        font-size: 0.95rem;
-        color: #9ca3af;
-    }
+    .understand-hero-sub { font-size: 0.95rem; color: #9ca3af; }
     .understand-card {
-        background: #111827;
-        border: 1px solid #374151;
-        border-radius: 16px;
-        padding: 32px 36px;
-        margin: 24px auto 0 auto;
-        max-width: 760px;
+        background: #111827; border: 1px solid #374151;
+        border-radius: 16px; padding: 32px 36px;
+        margin: 24px auto 0 auto; max-width: 760px;
     }
     .understand-section {
-        font-size: 0.72rem;
-        font-weight: 600;
-        letter-spacing: 0.1em;
-        text-transform: uppercase;
-        color: #6366f1;
-        margin-bottom: 10px;
+        font-size: 0.72rem; font-weight: 600; letter-spacing: 0.1em;
+        text-transform: uppercase; color: #6366f1; margin-bottom: 10px;
     }
-    .understand-text {
-        color: #d1d5db;
-        font-size: 0.95rem;
-        line-height: 1.85;
-    }
+    .understand-text { color: #d1d5db; font-size: 0.95rem; line-height: 1.85; }
     .paper-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: #1e1b4b;
-        border: 1px solid #4f46e5;
-        color: #818cf8;
-        padding: 5px 14px;
-        border-radius: 20px;
-        font-size: 0.78rem;
-        font-weight: 500;
-        margin-bottom: 20px;
+        display: inline-flex; align-items: center; gap: 6px;
+        background: #1e1b4b; border: 1px solid #4f46e5; color: #818cf8;
+        padding: 5px 14px; border-radius: 20px; font-size: 0.78rem;
+        font-weight: 500; margin-bottom: 20px;
     }
-    .understand-divider {
-        border: none;
-        border-top: 1px solid #1f2937;
-        margin: 20px 0;
-    }
+    .understand-divider { border: none; border-top: 1px solid #1f2937; margin: 20px 0; }
 
-    /* ── Validate screen ── */
+    /* ── Validate ── */
     .col-label {
-        font-size: 0.85rem;
-        font-weight: 600;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-        padding-bottom: 10px;
-        margin-bottom: 14px;
+        font-size: 0.85rem; font-weight: 600; letter-spacing: 0.05em;
+        text-transform: uppercase; padding-bottom: 10px; margin-bottom: 14px;
     }
     .col-upload  { color: #818cf8; border-bottom: 2px solid #4f46e5; }
     .col-green   { color: #4ade80; border-bottom: 2px solid #16a34a; }
     .col-red     { color: #f87171; border-bottom: 2px solid #dc2626; }
-    .col-pending { color: #fbbf24; border-bottom: 2px solid #d97706; }
-
     .paper-card {
-        border-radius: 10px;
-        padding: 10px 14px;
-        margin-bottom: 8px;
-        font-size: 0.83rem;
-        display: flex;
-        align-items: flex-start;
-        gap: 8px;
-        word-break: break-word;
+        border-radius: 10px; padding: 10px 14px; margin-bottom: 8px;
+        font-size: 0.83rem; display: flex; align-items: flex-start;
+        gap: 8px; word-break: break-word;
     }
-    .paper-card-green {
-        background: #052e16;
-        border: 1px solid #16a34a;
-        color: #bbf7d0;
-    }
-    .paper-card-red {
-        background: #1c0a0a;
-        border: 1px solid #dc2626;
-        color: #fecaca;
-    }
+    .paper-card-green { background: #052e16; border: 1px solid #16a34a; color: #bbf7d0; }
+    .paper-card-red   { background: #1c0a0a; border: 1px solid #dc2626; color: #fecaca; }
     .paper-card-reason {
-        font-size: 0.75rem;
-        color: #9ca3af;
-        margin-top: 4px;
-        font-style: italic;
-        line-height: 1.5;
+        font-size: 0.75rem; color: #9ca3af; margin-top: 4px;
+        font-style: italic; line-height: 1.5;
     }
-    .empty-state {
-        color: #374151;
-        font-size: 0.82rem;
-        font-style: italic;
-        padding: 12px 0;
-    }
+    .empty-state { color: #374151; font-size: 0.82rem; font-style: italic; padding: 12px 0; }
 
     /* ── Pending review cards ── */
     .pending-card {
-        background: #111827;
-        border: 1px solid #374151;
-        border-radius: 12px;
-        padding: 18px 20px;
-        margin-bottom: 14px;
+        background: #111827; border: 1px solid #374151;
+        border-radius: 12px; padding: 18px 20px; margin-bottom: 14px;
     }
     .pending-paper-name {
-        font-size: 0.92rem;
-        font-weight: 600;
-        color: #e2e8f0;
-        margin-bottom: 10px;
-        word-break: break-word;
+        font-size: 0.92rem; font-weight: 600; color: #e2e8f0;
+        margin-bottom: 10px; word-break: break-word;
     }
     .verdict-badge-rel {
-        display: inline-block;
-        background: #052e16;
-        border: 1px solid #16a34a;
-        color: #4ade80;
-        padding: 3px 12px;
-        border-radius: 12px;
-        font-size: 0.73rem;
-        font-weight: 700;
-        letter-spacing: 0.04em;
-        margin-bottom: 10px;
+        display: inline-block; background: #052e16; border: 1px solid #16a34a;
+        color: #4ade80; padding: 3px 12px; border-radius: 12px;
+        font-size: 0.73rem; font-weight: 700; letter-spacing: 0.04em; margin-bottom: 10px;
     }
     .verdict-badge-norel {
-        display: inline-block;
-        background: #1c0a0a;
-        border: 1px solid #dc2626;
-        color: #f87171;
-        padding: 3px 12px;
-        border-radius: 12px;
-        font-size: 0.73rem;
-        font-weight: 700;
-        letter-spacing: 0.04em;
-        margin-bottom: 10px;
+        display: inline-block; background: #1c0a0a; border: 1px solid #dc2626;
+        color: #f87171; padding: 3px 12px; border-radius: 12px;
+        font-size: 0.73rem; font-weight: 700; letter-spacing: 0.04em; margin-bottom: 10px;
+    }
+    .confidence-badge {
+        display: inline-block; background: #1a1a2e; border: 1px solid #374151;
+        color: #9ca3af; padding: 3px 10px; border-radius: 12px;
+        font-size: 0.73rem; font-weight: 600; margin-left: 8px; margin-bottom: 10px;
     }
     .pending-reason {
-        color: #9ca3af;
-        font-size: 0.84rem;
-        line-height: 1.65;
-        margin-bottom: 14px;
-        padding: 10px 14px;
-        background: #0f1117;
-        border-left: 3px solid #374151;
-        border-radius: 0 6px 6px 0;
+        color: #9ca3af; font-size: 0.84rem; line-height: 1.65; margin-bottom: 14px;
+        padding: 10px 14px; background: #0f1117;
+        border-left: 3px solid #374151; border-radius: 0 6px 6px 0;
     }
     .pending-section-header {
-        font-size: 0.85rem;
-        font-weight: 600;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-        color: #fbbf24;
-        border-bottom: 2px solid #d97706;
-        padding-bottom: 10px;
-        margin: 24px 0 16px 0;
+        font-size: 0.85rem; font-weight: 600; letter-spacing: 0.05em;
+        text-transform: uppercase; color: #fbbf24; border-bottom: 2px solid #d97706;
+        padding-bottom: 10px; margin: 24px 0 16px 0;
     }
 
-    /* ── Review screen ── */
+    /* ── Review ── */
     .review-wrapper {
-        background: #111827;
-        border: 1px solid #1f2937;
-        border-radius: 16px;
-        padding: 40px 48px;
-        margin-top: 24px;
+        background: #111827; border: 1px solid #1f2937;
+        border-radius: 16px; padding: 40px 48px; margin-top: 24px;
     }
-    .review-doc-title {
-        font-size: 1.6rem;
-        font-weight: 700;
-        color: #f9fafb;
-        margin-bottom: 4px;
-    }
+    .review-doc-title { font-size: 1.6rem; font-weight: 700; color: #f9fafb; margin-bottom: 4px; }
     .review-section {
-        font-size: 0.75rem;
-        font-weight: 600;
-        letter-spacing: 0.1em;
-        text-transform: uppercase;
-        color: #6366f1;
-        margin: 28px 0 10px 0;
+        font-size: 0.75rem; font-weight: 600; letter-spacing: 0.1em;
+        text-transform: uppercase; color: #6366f1; margin: 28px 0 10px 0;
     }
-    .review-body {
-        color: #d1d5db;
-        font-size: 0.93rem;
-        line-height: 1.85;
-    }
-    .ref-item {
-        color: #9ca3af;
-        font-size: 0.88rem;
-        margin-bottom: 6px;
-    }
+    .review-body { color: #d1d5db; font-size: 0.93rem; line-height: 1.85; }
+    .ref-item { color: #9ca3af; font-size: 0.88rem; margin-bottom: 6px; }
     .hr { border: none; border-top: 1px solid #1f2937; margin: 28px 0; }
+
+    /* ── Review Quality Panel ── */
+    .quality-panel {
+        background: #0c1019; border: 1px solid #1f2937;
+        border-radius: 12px; padding: 24px 28px; margin-top: 28px;
+    }
+    .quality-title {
+        font-size: 0.72rem; font-weight: 600; letter-spacing: 0.1em;
+        text-transform: uppercase; color: #6366f1; margin-bottom: 14px;
+    }
+    .quality-overall { font-size: 1rem; font-weight: 700; margin-bottom: 18px; }
+    .quality-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .quality-table th {
+        color: #6b7280; font-weight: 600; text-align: left;
+        padding: 6px 12px; border-bottom: 1px solid #1f2937;
+    }
+    .quality-table td { color: #d1d5db; padding: 8px 12px; border-bottom: 1px solid #111827; }
+    .quality-table tr:last-child td { border-bottom: none; }
 
     /* ── Buttons ── */
     .stButton > button {
         background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
-        color: white !important;
-        border: none !important;
-        border-radius: 8px !important;
-        padding: 10px 20px !important;
-        font-weight: 500 !important;
-        font-size: 0.9rem !important;
-        width: 100%;
-        transition: opacity 0.2s !important;
+        color: white !important; border: none !important;
+        border-radius: 8px !important; padding: 10px 20px !important;
+        font-weight: 500 !important; font-size: 0.9rem !important;
+        width: 100%; transition: opacity 0.2s !important;
     }
     .stButton > button:hover { opacity: 0.88 !important; }
-
     .stDownloadButton > button {
         background: linear-gradient(135deg, #059669, #0d9488) !important;
-        color: white !important;
-        border: none !important;
-        border-radius: 8px !important;
-        font-weight: 500 !important;
-        width: 100%;
+        color: white !important; border: none !important;
+        border-radius: 8px !important; font-weight: 500 !important; width: 100%;
     }
 
     /* ── Loading ── */
-    .load-msg {
-        color: #818cf8;
-        font-size: 0.9rem;
-        text-align: center;
-        padding: 6px 0;
-    }
+    .load-msg { color: #818cf8; font-size: 0.9rem; text-align: center; padding: 6px 0; }
 
-    /* hide streamlit chrome */
     #MainMenu { visibility: hidden; }
-    footer { visibility: hidden; }
-    header { visibility: hidden; }
+    footer     { visibility: hidden; }
+    header     { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -358,12 +226,13 @@ defaults = {
     "research_idea": "",
     "accepted_papers": [],
     "rejected_papers": [],
-    "pending_papers": [],          # list of {name, verdict, reason, chunks}
+    "pending_papers": [],          # {name, verdict, reason, confidence, chunks}
     "root_paper_name": "",
     "literature_review": "",
     "review_title": "",
+    "review_quality": None,        # {paper_stats, overall} computed by evaluator
     "processed_candidates": set(),
-    "context_understanding": "",   # LLM summary shown on understand screen
+    "context_understanding": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -380,21 +249,18 @@ def loading_animation(messages, delay=0.9):
 
 
 def parse_verdict(full_response):
-    """Split the LLM verdict response into (verdict_str, reason_str)."""
     text = full_response.strip()
     lines = text.split("\n")
-    first_line = lines[0].strip().upper()
+    first_upper = lines[0].strip().upper()
     reason_lines = [l.strip() for l in lines[1:] if l.strip()]
     reason = " ".join(reason_lines) if reason_lines else text
 
-    if "NOT RELEVANT" in first_line:
-        verdict = "NOT RELEVANT"
-    elif "RELEVANT" in first_line:
-        verdict = "RELEVANT"
-    else:
-        # fallback: scan whole text
-        verdict = "NOT RELEVANT" if "NOT RELEVANT" in text.upper() else "RELEVANT"
-
+    if "NOT RELEVANT" in first_upper:
+        return "NOT RELEVANT", reason
+    elif "RELEVANT" in first_upper:
+        return "RELEVANT", reason
+    # fallback
+    verdict = "NOT RELEVANT" if "NOT RELEVANT" in text.upper() else "RELEVANT"
     return verdict, reason
 
 
@@ -405,8 +271,7 @@ def generate_docx(title, review_text, papers):
     doc.add_paragraph(review_text)
     doc.add_heading("References", level=1)
     for i, p in enumerate(papers, 1):
-        # Bug 2 fix: don't use "List Number" style — it auto-numbers, causing double numbering
-        doc.add_paragraph(f"{i}. {p}")
+        doc.add_paragraph(f"{i}. {p}")   # no "List Number" style — avoids double numbering
     buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -421,6 +286,17 @@ def navbar(center_text=""):
         <div class="navbar-right"></div>
     </div>
     """, unsafe_allow_html=True)
+
+
+def quality_bar_html(pct: int, color: str) -> str:
+    width = max(4, pct)   # minimum 4 px so the bar is visible at 0%
+    return (
+        f'<div style="display:flex;align-items:center;gap:8px;">'
+        f'<div style="width:{width}px;height:6px;background:linear-gradient(90deg,#6366f1,#8b5cf6);'
+        f'border-radius:3px;"></div>'
+        f'<span style="color:{color};font-weight:600;">{pct}%</span>'
+        f'</div>'
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCREEN 1 — Welcome
@@ -457,10 +333,8 @@ if st.session_state.screen == "welcome":
         st.markdown('<div class="form-label">Root Paper</div>', unsafe_allow_html=True)
         st.markdown('<div class="form-sub">Upload the foundation paper your research is built on.</div>', unsafe_allow_html=True)
         root_file = st.file_uploader(
-            label="root_upload",
-            label_visibility="collapsed",
-            type="pdf",
-            key="root_upload"
+            label="root_upload", label_visibility="collapsed",
+            type="pdf", key="root_upload"
         )
 
         st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
@@ -479,7 +353,6 @@ if st.session_state.screen == "welcome":
                     "Building your knowledge base...",
                     "Almost ready..."
                 ])
-                # Bug 4 fix: use try/finally to guarantee temp file cleanup
                 tmp_path = None
                 try:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -487,6 +360,9 @@ if st.session_state.screen == "welcome":
                         tmp_path = tmp.name
                     chunks = load_and_split(tmp_path)
                     store_chunks(chunks, root_file.name)
+                except Exception as e:
+                    st.error(f"Failed to process root paper: {e}")
+                    st.stop()
                 finally:
                     if tmp_path and os.path.exists(tmp_path):
                         os.unlink(tmp_path)
@@ -497,7 +373,7 @@ if st.session_state.screen == "welcome":
                 st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SCREEN 2 — Understand (new: LLM explains what it learned)
+# SCREEN 2 — Understand
 # ═══════════════════════════════════════════════════════════════════════════════
 
 elif st.session_state.screen == "understand":
@@ -513,11 +389,12 @@ elif st.session_state.screen == "understand":
             "Building research context summary...",
         ], delay=1.0)
 
-        llm = get_llm()
-        root_chunks = search_similar(st.session_state.research_idea, k=6)
-        context = "\n\n".join([c.page_content for c in root_chunks])
+        try:
+            llm = get_llm()
+            root_chunks = search_similar(st.session_state.research_idea, k=6)
+            context = "\n\n".join([c.page_content for c in root_chunks])
 
-        response = llm.invoke(f"""You are a research assistant reviewing a user's research idea and their root academic paper.
+            response = call_llm_safe(llm, f"""You are a research assistant reviewing a user's research idea and their root academic paper.
 
 Research idea provided by the user:
 "{st.session_state.research_idea}"
@@ -531,11 +408,14 @@ Write a clear, specific research context summary in 4–5 sentences covering:
 3. The gap or problem this research addresses
 4. What types of candidate papers would be considered relevant for the literature review
 
-Write in academic prose. Be specific and grounded in the content above. Do not use bullet points.
+Write in academic prose. Be specific. Do not use bullet points.
 """)
+            understanding = response.content if hasattr(response, "content") else str(response)
+            st.session_state.context_understanding = understanding.strip()
+        except Exception as e:
+            st.error(f"Could not generate research context — check your GROQ_API_KEY. Error: {e}")
+            st.stop()
 
-        understanding = response.content if hasattr(response, "content") else str(response)
-        st.session_state.context_understanding = understanding.strip()
         st.rerun()
 
     else:
@@ -583,20 +463,16 @@ elif st.session_state.screen == "validate":
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Upload section ────────────────────────────────────────────────────────
+    # ── Upload ────────────────────────────────────────────────────────────────
     up_col, _, _ = st.columns([1, 1, 1], gap="large")
     with up_col:
         st.markdown('<div class="col-label col-upload">📄 Upload Candidate Paper</div>', unsafe_allow_html=True)
         candidate_file = st.file_uploader(
-            label="candidate_upload",
-            label_visibility="collapsed",
-            type="pdf",
-            key="candidate_upload"
+            label="candidate_upload", label_visibility="collapsed",
+            type="pdf", key="candidate_upload"
         )
 
         if candidate_file and candidate_file.name not in st.session_state.processed_candidates:
-
-            # Bug 4 fix: try/finally for temp file cleanup
             tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -605,25 +481,36 @@ elif st.session_state.screen == "validate":
 
                 loading_animation([
                     "Parsing paper content...",
-                    "Analysing relevance to your research...",
+                    "Ranking chunks by semantic relevance...",
                     "Consulting LitMap intelligence...",
                     "Generating verdict and reasoning..."
                 ], delay=0.7)
 
-                # Bug 1 fix: use the candidate paper's own chunks for relevance check
-                # (not a DB search, which would return root paper chunks)
                 chunks = load_and_split(tmp_path)
 
+            except Exception as e:
+                st.error(f"Failed to parse paper: {e}")
+                st.stop()
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     os.unlink(tmp_path)
 
-            # Use first 5 chunks as a representative sample to keep the prompt concise
-            full_verdict_text = check_relevance(
-                st.session_state.research_idea,
-                candidate_file.name,
-                chunks[:5]
+            # Fix 1: use semantically top-ranked chunks from the candidate paper
+            # instead of blindly taking the first 5
+            top_chunks, confidence = get_top_chunks_by_similarity(
+                st.session_state.research_idea, chunks, k=6
             )
+
+            try:
+                full_verdict_text = check_relevance(
+                    st.session_state.research_idea,
+                    candidate_file.name,
+                    top_chunks
+                )
+            except Exception as e:
+                st.error(f"LLM relevance check failed: {e}")
+                st.stop()
+
             verdict, reason = parse_verdict(full_verdict_text)
 
             st.session_state.processed_candidates.add(candidate_file.name)
@@ -631,11 +518,12 @@ elif st.session_state.screen == "validate":
                 "name": candidate_file.name,
                 "verdict": verdict,
                 "reason": reason,
+                "confidence": confidence,   # Fix 2: store for display
                 "chunks": chunks,
             })
             st.rerun()
 
-    # ── Pending review section ────────────────────────────────────────────────
+    # ── Pending review ────────────────────────────────────────────────────────
     if st.session_state.pending_papers:
         st.markdown('<div class="pending-section-header">⏳ Awaiting Your Review</div>', unsafe_allow_html=True)
 
@@ -648,10 +536,14 @@ elif st.session_state.screen == "validate":
                 if paper["verdict"] == "RELEVANT"
                 else '<span class="verdict-badge-norel">❌ AI says: Not Relevant</span>'
             )
+            conf = paper["confidence"]
+            col = confidence_color(conf)
+            conf_badge = f'<span class="confidence-badge" style="color:{col};">Confidence: {conf}%</span>'
+
             st.markdown(f"""
             <div class="pending-card">
                 <div class="pending-paper-name">📄 {paper["name"]}</div>
-                {verdict_badge}
+                {verdict_badge}{conf_badge}
                 <div class="pending-reason"><strong>Reasoning:</strong> {paper["reason"]}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -666,7 +558,6 @@ elif st.session_state.screen == "validate":
                     pending_action = "reject"
                     pending_action_idx = i
 
-        # Process the user's override decision
         if pending_action == "accept" and pending_action_idx is not None:
             paper = st.session_state.pending_papers[pending_action_idx]
             store_chunks(paper["chunks"], paper["name"])
@@ -677,15 +568,12 @@ elif st.session_state.screen == "validate":
 
         elif pending_action == "reject" and pending_action_idx is not None:
             paper = st.session_state.pending_papers[pending_action_idx]
-            st.session_state.rejected_papers.append({
-                "name": paper["name"],
-                "reason": paper["reason"],
-            })
+            st.session_state.rejected_papers.append({"name": paper["name"], "reason": paper["reason"]})
             st.session_state.pending_papers.pop(pending_action_idx)
             st.toast(f"❌ Rejected: {paper['name']}", icon="❌")
             st.rerun()
 
-    # ── Accepted / Rejected columns ───────────────────────────────────────────
+    # ── Accepted / Rejected ───────────────────────────────────────────────────
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     col_rel, col_rej = st.columns([1, 1], gap="large")
 
@@ -712,7 +600,7 @@ elif st.session_state.screen == "validate":
         else:
             st.markdown('<div class="empty-state">No rejected papers yet</div>', unsafe_allow_html=True)
 
-    # ── Done button ───────────────────────────────────────────────────────────
+    # ── Done ──────────────────────────────────────────────────────────────────
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
     _, done_col, _ = st.columns([2, 1, 2])
     with done_col:
@@ -737,47 +625,85 @@ elif st.session_state.screen == "review":
 
         loading_animation([
             "Gathering accepted papers...",
-            "Retrieving key excerpts...",
+            "Retrieving key excerpts per paper...",
+            "Balancing context across sources...",
             "Identifying thematic connections...",
             "Drafting literature review...",
             "Generating title...",
-            "Compiling references...",
+            "Computing retrieval quality...",
             "Finalising document..."
         ], delay=1.0)
 
-        llm = get_llm()
-        all_chunks = search_similar(st.session_state.research_idea, k=10)
-        context = "\n\n".join([c.page_content for c in all_chunks])
+        try:
+            llm = get_llm()
 
-        title_response = llm.invoke(
-            f"Generate a concise academic title (maximum 12 words) for a literature review on this topic: {st.session_state.research_idea}. Return only the title, nothing else."
-        )
-        st.session_state.review_title = (
-            title_response.content.strip()
-            if hasattr(title_response, "content")
-            else str(title_response).strip()
-        )
+            # Fix 3 + 4: retrieve balanced chunks per paper (not a flat top-10 dump)
+            # Each paper gets its own context section so the LLM can write about all of them
+            paper_sections = []
+            for paper in st.session_state.accepted_papers:
+                chunks = search_similar_filtered(st.session_state.research_idea, paper, k=4)
+                if chunks:
+                    section_text = "\n\n".join([c.page_content for c in chunks])
+                    paper_sections.append(f"[Source: {paper}]\n{section_text}")
 
-        review_response = llm.invoke(f"""
+            context = "\n\n---\n\n".join(paper_sections) if paper_sections else "No excerpts available."
+
+            # Generate title
+            title_response = call_llm_safe(
+                llm,
+                f"Generate a concise academic title (maximum 12 words) for a literature review on this topic: "
+                f"{st.session_state.research_idea}. Return only the title, nothing else."
+            )
+            st.session_state.review_title = (
+                title_response.content.strip()
+                if hasattr(title_response, "content")
+                else str(title_response).strip()
+            )
+
+            # Generate review — prompt now receives labelled per-paper sections
+            review_response = call_llm_safe(llm, f"""
 You are an academic research assistant. Write a structured literature review.
 
 Research idea: {st.session_state.research_idea}
+
 Accepted papers: {', '.join(st.session_state.accepted_papers)}
-Excerpts: {context}
+
+Excerpts organised by paper (each section is labelled with its source):
+{context}
 
 Structure:
-- Introduction paragraph
-- Numbered analysis per paper (paper name bold, 2-3 sentences linking it to research idea)
-- Conclusion paragraph
+- Introduction paragraph summarising the research landscape
+- Numbered analysis per paper (use the paper name in bold, 2-3 sentences linking it to the research idea)
+- Conclusion paragraph synthesising the reviewed works
 
-Use clear academic language.
+Every accepted paper must be discussed. Use clear academic language.
 """)
-        raw_review = (
-            review_response.content
-            if hasattr(review_response, "content")
-            else str(review_response)
-        )
-        st.session_state.literature_review = raw_review
+            raw_review = (
+                review_response.content
+                if hasattr(review_response, "content")
+                else str(review_response)
+            )
+            st.session_state.literature_review = raw_review
+
+        except Exception as e:
+            st.error(f"Literature review generation failed: {e}. Please try again.")
+            st.stop()
+
+        # Fix 2: compute retrieval quality metrics for the quality panel
+        try:
+            paper_stats, overall_confidence = compute_review_quality(
+                st.session_state.research_idea,
+                st.session_state.accepted_papers,
+                search_similar_filtered,
+                k_per_paper=4
+            )
+            st.session_state.review_quality = {
+                "paper_stats": paper_stats,
+                "overall": overall_confidence,
+            }
+        except Exception:
+            st.session_state.review_quality = None   # non-fatal — skip panel
+
         st.rerun()
 
     else:
@@ -793,6 +719,42 @@ Use clear academic language.
             {"".join([f'<div class="ref-item">{i+1}. {p}</div>' for i, p in enumerate(st.session_state.accepted_papers)])}
         </div>
         """, unsafe_allow_html=True)
+
+        # Fix 2: Retrieval Quality panel
+        quality = st.session_state.review_quality
+        if quality:
+            overall = quality["overall"]
+            paper_stats = quality["paper_stats"]
+            overall_col = confidence_color(overall)
+
+            rows_html = ""
+            for paper, stats in paper_stats.items():
+                conf = stats["confidence"]
+                col = confidence_color(conf)
+                rows_html += f"""
+                <tr>
+                    <td style="word-break:break-word;max-width:320px;">{paper}</td>
+                    <td style="text-align:center;">{stats['chunks_retrieved']}</td>
+                    <td>{quality_bar_html(conf, col)}</td>
+                </tr>
+                """
+
+            st.markdown(f"""
+            <div class="quality-panel">
+                <div class="quality-title">📊 Retrieval Quality</div>
+                <div class="quality-overall" style="color:{overall_col};">
+                    Overall Retrieval Confidence: {overall}%
+                </div>
+                <table class="quality-table">
+                    <tr>
+                        <th>Paper</th>
+                        <th style="text-align:center;">Chunks Retrieved</th>
+                        <th>Relevance Confidence</th>
+                    </tr>
+                    {rows_html}
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
 
         st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
 

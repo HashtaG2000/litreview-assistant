@@ -10,3 +10,4 @@ pypdf
 python-docx
 python-dotenv
 groq
+numpy
