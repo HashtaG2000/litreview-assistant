@@ -18,4 +18,4 @@ enableXsrfProtection = false\n\
 port = 8501\n\
 " > /root/.streamlit/config.toml
 
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD sh -c "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0"
