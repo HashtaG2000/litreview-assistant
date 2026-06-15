@@ -5,16 +5,13 @@ import tempfile
 import re
 from docx import Document as DocxDocument
 from io import BytesIO
-from ingestor import load_and_split, store_chunks
-from retriever import search_similar, search_similar_filtered, check_relevance, check_counter_relevance
-from llm import get_llm, call_llm_safe
-from evaluator import (
-    get_top_chunks_by_similarity,
-    compute_review_quality,
-    confidence_color,
-)
-from synthesizer import build_synthesis_matrix, detect_contradictions
-from semantic_scholar import SemanticScholarClient
+from core.ingestion import load_and_split, store_chunks
+from core.retrieval import search_similar, search_similar_filtered
+from core.analysis.relevance import check_relevance, check_counter_relevance
+from core.llm import get_llm, call_llm_safe
+from core.analysis.evaluator import get_top_chunks_by_similarity, compute_review_quality, confidence_color
+from core.analysis.synthesizer import build_synthesis_matrix, detect_contradictions
+from core.scholar import SemanticScholarClient
 
 st.set_page_config(
     page_title="LitMap",

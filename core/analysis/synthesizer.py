@@ -1,5 +1,6 @@
 import re
 from typing import TypedDict
+from core.llm import call_llm_safe
 
 
 class SynthesisMatrix(TypedDict):
@@ -10,16 +11,18 @@ class SynthesisMatrix(TypedDict):
     limitations: str
 
 
+# ── LLM output parsing ─────────────────────────────────────────────────────────
+
 def _parse_field(text: str, label: str) -> str:
     pattern = rf'{label}:\s*(.+?)(?=\n[A-Z_]{{3,}}:|$)'
     match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return "Not specified"
+    return match.group(1).strip() if match else "Not specified"
 
+
+# ── Per-paper extraction ───────────────────────────────────────────────────────
 
 def extract_matrix_row(llm, paper_title: str, chunks: list, research_idea: str) -> SynthesisMatrix:
-    from llm import call_llm_safe
+    """Extract structured metadata from a single paper's chunks."""
     context = "\n\n".join([c.page_content for c in chunks[:6]])
     prompt = f"""You are extracting structured data from an academic paper for a literature review synthesis matrix.
 
@@ -29,12 +32,12 @@ Paper: {paper_title}
 Excerpts from the paper:
 {context}
 
-Extract the following. Write "Not specified" if a field cannot be determined from the excerpts.
+Extract the following. Write "Not specified" if a field cannot be determined.
 Output ONLY these four labeled fields:
 
-SAMPLE_SIZE: (dataset size, number of participants, or data scope used in the study)
-METHODOLOGY: (research method or experimental approach used)
-KEY_FINDINGS: (main results or conclusions in 1-2 sentences)
+SAMPLE_SIZE: (dataset size, number of participants, or data scope)
+METHODOLOGY: (research method or experimental approach)
+KEY_FINDINGS: (main results or conclusions, 1-2 sentences)
 LIMITATIONS: (limitations acknowledged by the authors)
 """
     try:
@@ -57,19 +60,37 @@ LIMITATIONS: (limitations acknowledged by the authors)
         )
 
 
-def build_synthesis_matrix(llm, accepted_papers: list, search_fn, research_idea: str, session_id: str) -> list:
-    matrix = []
-    for paper in accepted_papers:
-        chunks = search_fn(research_idea, paper, k=6, session_id=session_id)
-        row = extract_matrix_row(llm, paper, chunks, research_idea)
-        matrix.append(row)
-    return matrix
+# ── Batch extraction ───────────────────────────────────────────────────────────
 
+def build_synthesis_matrix(
+    llm,
+    accepted_papers: list,
+    search_fn,
+    research_idea: str,
+    session_id: str,
+) -> list:
+    """Build a synthesis matrix row for every accepted paper."""
+    return [
+        extract_matrix_row(
+            llm,
+            paper,
+            search_fn(research_idea, paper, k=6, session_id=session_id),
+            research_idea,
+        )
+        for paper in accepted_papers
+    ]
+
+
+# ── Contradiction / consensus detection ───────────────────────────────────────
 
 def detect_contradictions(llm, matrix: list, research_idea: str) -> str:
-    from llm import call_llm_safe
+    """
+    Compare key findings across all papers and highlight where they agree
+    or contradict each other.  Returns a formatted prose string.
+    """
     if len(matrix) < 2:
         return ""
+
     findings_list = "\n".join([
         f"{i+1}. [{row['paper_title']}]: {row['key_findings']}"
         for i, row in enumerate(matrix)
