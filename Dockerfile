@@ -15,13 +15,8 @@ RUN mkdir -p /data/chroma_store
 
 EXPOSE 8501
 
+# Copy Streamlit config (sets headless, disables noisy file watcher, error-only logging)
 RUN mkdir -p /root/.streamlit
-RUN echo "\
-[server]\n\
-headless = true\n\
-enableCORS = false\n\
-enableXsrfProtection = false\n\
-port = 8501\n\
-" > /root/.streamlit/config.toml
+COPY .streamlit/config.toml /root/.streamlit/config.toml
 
 CMD sh -c "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0"
