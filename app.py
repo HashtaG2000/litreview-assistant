@@ -1,17 +1,20 @@
 import streamlit as st
 import os
+import uuid
 import tempfile
-import time
+import re
 from docx import Document as DocxDocument
 from io import BytesIO
 from ingestor import load_and_split, store_chunks
-from retriever import search_similar, search_similar_filtered, check_relevance
+from retriever import search_similar, search_similar_filtered, check_relevance, check_counter_relevance
 from llm import get_llm, call_llm_safe
 from evaluator import (
     get_top_chunks_by_similarity,
     compute_review_quality,
     confidence_color,
 )
+from synthesizer import build_synthesis_matrix, detect_contradictions
+from semantic_scholar import SemanticScholarClient
 
 st.set_page_config(
     page_title="LitMap",
@@ -163,6 +166,16 @@ st.markdown("""
         padding-bottom: 10px; margin: 24px 0 16px 0;
     }
 
+    /* ── Suggestion cards (Semantic Scholar) ── */
+    .suggestion-card {
+        background: #0c1019; border: 1px solid #1e3a5f;
+        border-radius: 10px; padding: 14px 18px; margin-bottom: 10px;
+    }
+    .suggestion-title { font-size: 0.88rem; font-weight: 600; color: #93c5fd; margin-bottom: 4px; }
+    .suggestion-year { font-size: 0.75rem; color: #6b7280; margin-bottom: 6px; }
+    .suggestion-relevance { font-size: 0.82rem; color: #a5b4fc; font-style: italic; margin-bottom: 6px; }
+    .suggestion-abstract { font-size: 0.78rem; color: #6b7280; line-height: 1.5; }
+
     /* ── Review ── */
     .review-wrapper {
         background: #111827; border: 1px solid #1f2937;
@@ -176,6 +189,38 @@ st.markdown("""
     .review-body { color: #d1d5db; font-size: 0.93rem; line-height: 1.85; }
     .ref-item { color: #9ca3af; font-size: 0.88rem; margin-bottom: 6px; }
     .hr { border: none; border-top: 1px solid #1f2937; margin: 28px 0; }
+
+    /* ── Synthesis Matrix ── */
+    .matrix-panel {
+        background: #0c1019; border: 1px solid #1f2937;
+        border-radius: 12px; padding: 24px 28px; margin-top: 28px;
+    }
+    .matrix-title {
+        font-size: 0.72rem; font-weight: 600; letter-spacing: 0.1em;
+        text-transform: uppercase; color: #06b6d4; margin-bottom: 16px;
+    }
+    .matrix-table { width: 100%; border-collapse: collapse; font-size: 0.80rem; }
+    .matrix-table th {
+        color: #6b7280; font-weight: 600; text-align: left;
+        padding: 7px 12px; border-bottom: 1px solid #1f2937; white-space: nowrap;
+    }
+    .matrix-table td {
+        color: #d1d5db; padding: 9px 12px; border-bottom: 1px solid #111827;
+        vertical-align: top; line-height: 1.5;
+    }
+    .matrix-table tr:last-child td { border-bottom: none; }
+    .matrix-paper-name { color: #818cf8; font-weight: 600; word-break: break-word; max-width: 180px; }
+
+    /* ── Contradictions panel ── */
+    .debate-panel {
+        background: #0c1019; border: 1px solid #1f2937;
+        border-radius: 12px; padding: 24px 28px; margin-top: 28px;
+    }
+    .debate-title {
+        font-size: 0.72rem; font-weight: 600; letter-spacing: 0.1em;
+        text-transform: uppercase; color: #f59e0b; margin-bottom: 14px;
+    }
+    .debate-body { color: #d1d5db; font-size: 0.88rem; line-height: 1.75; white-space: pre-wrap; }
 
     /* ── Review Quality Panel ── */
     .quality-panel {
@@ -210,27 +255,28 @@ st.markdown("""
         border-radius: 8px !important; font-weight: 500 !important; width: 100%;
     }
 
-    /* ── Loading ── */
-    .load-msg { color: #818cf8; font-size: 0.9rem; text-align: center; padding: 6px 0; }
-
     #MainMenu { visibility: hidden; }
     footer     { visibility: hidden; }
     header     { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state ─────────────────────────────────────────────────────────────
+# ── Session state ──────────────────────────────────────────────────────────────
 
 defaults = {
     "screen": "welcome",
+    "session_id": str(uuid.uuid4()),
     "research_idea": "",
     "accepted_papers": [],
     "rejected_papers": [],
-    "pending_papers": [],          # {name, verdict, reason, confidence, chunks}
+    "pending_papers": [],
     "root_paper_name": "",
     "literature_review": "",
     "review_title": "",
-    "review_quality": None,        # {paper_stats, overall} computed by evaluator
+    "review_quality": None,
+    "synthesis_matrix": None,
+    "contradiction_analysis": "",
+    "suggested_papers": [],
     "processed_candidates": set(),
     "context_understanding": "",
 }
@@ -238,15 +284,7 @@ for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def loading_animation(messages, delay=0.9):
-    ph = st.empty()
-    for msg in messages:
-        ph.markdown(f'<div class="load-msg">⏳ {msg}</div>', unsafe_allow_html=True)
-        time.sleep(delay)
-    ph.empty()
-
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def parse_verdict(full_response):
     text = full_response.strip()
@@ -254,24 +292,58 @@ def parse_verdict(full_response):
     first_upper = lines[0].strip().upper()
     reason_lines = [l.strip() for l in lines[1:] if l.strip()]
     reason = " ".join(reason_lines) if reason_lines else text
-
     if "NOT RELEVANT" in first_upper:
         return "NOT RELEVANT", reason
     elif "RELEVANT" in first_upper:
         return "RELEVANT", reason
-    # fallback
     verdict = "NOT RELEVANT" if "NOT RELEVANT" in text.upper() else "RELEVANT"
     return verdict, reason
 
 
-def generate_docx(title, review_text, papers):
+def _inline_citations(review_text: str, papers: list) -> str:
+    """Post-process review text to append [N] after paper name mentions."""
+    citation_map = {}
+    for i, paper in enumerate(papers, 1):
+        base = re.sub(r'\.pdf$', '', paper, flags=re.IGNORECASE)
+        base = base.replace('_', ' ').replace('-', ' ')
+        citation_map[base.lower()[:40]] = (base, i)
+
+    result = review_text
+    for key, (base, num) in citation_map.items():
+        pattern = re.compile(re.escape(base), re.IGNORECASE)
+        result = pattern.sub(f"{base} [{num}]", result, count=1)
+    return result
+
+
+def generate_docx(title, review_text, papers, matrix=None):
     doc = DocxDocument()
     doc.add_heading(title, 0)
+
     doc.add_heading("Literature Review", level=1)
-    doc.add_paragraph(review_text)
+    cited_text = _inline_citations(review_text, papers)
+    doc.add_paragraph(cited_text)
+
+    # Synthesis matrix table
+    if matrix:
+        doc.add_heading("Synthesis Matrix", level=1)
+        headers = ["Paper", "Sample Size", "Methodology", "Key Findings", "Limitations"]
+        table = doc.add_table(rows=1, cols=len(headers))
+        table.style = "Table Grid"
+        hdr_cells = table.rows[0].cells
+        for i, h in enumerate(headers):
+            hdr_cells[i].text = h
+        for row in matrix:
+            cells = table.add_row().cells
+            cells[0].text = row.get("paper_title", "")
+            cells[1].text = row.get("sample_size", "")
+            cells[2].text = row.get("methodology", "")
+            cells[3].text = row.get("key_findings", "")
+            cells[4].text = row.get("limitations", "")
+
     doc.add_heading("References", level=1)
     for i, p in enumerate(papers, 1):
-        doc.add_paragraph(f"{i}. {p}")   # no "List Number" style — avoids double numbering
+        doc.add_paragraph(f"{i}. {p}")
+
     buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -289,7 +361,7 @@ def navbar(center_text=""):
 
 
 def quality_bar_html(pct: int, color: str) -> str:
-    width = max(4, pct)   # minimum 4 px so the bar is visible at 0%
+    width = max(4, pct)
     return (
         f'<div style="display:flex;align-items:center;gap:8px;">'
         f'<div style="width:{width}px;height:6px;background:linear-gradient(90deg,#6366f1,#8b5cf6);'
@@ -346,20 +418,18 @@ if st.session_state.screen == "welcome":
                 st.error("Please upload your root paper.")
             else:
                 st.session_state.research_idea = research_idea
-                loading_animation([
-                    "Analysing your research topic...",
-                    "Parsing root paper...",
-                    "Chunking and embedding content...",
-                    "Building your knowledge base...",
-                    "Almost ready..."
-                ])
                 tmp_path = None
                 try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                        tmp.write(root_file.read())
-                        tmp_path = tmp.name
-                    chunks = load_and_split(tmp_path)
-                    store_chunks(chunks, root_file.name)
+                    with st.status("Processing root paper...", expanded=True) as status:
+                        st.write("Parsing PDF content...")
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                            tmp.write(root_file.read())
+                            tmp_path = tmp.name
+                        chunks = load_and_split(tmp_path)
+                        st.write(f"Identified {len(chunks)} sections and chunks...")
+                        st.write("Building knowledge base...")
+                        store_chunks(chunks, root_file.name, st.session_state.session_id)
+                        status.update(label="Root paper processed!", state="complete")
                 except Exception as e:
                     st.error(f"Failed to process root paper: {e}")
                     st.stop()
@@ -382,19 +452,18 @@ elif st.session_state.screen == "understand":
 
     if not st.session_state.context_understanding:
 
-        loading_animation([
-            "Reading your research idea...",
-            "Analysing root paper content...",
-            "Identifying key themes and concepts...",
-            "Building research context summary...",
-        ], delay=1.0)
-
         try:
-            llm = get_llm()
-            root_chunks = search_similar(st.session_state.research_idea, k=6)
-            context = "\n\n".join([c.page_content for c in root_chunks])
-
-            response = call_llm_safe(llm, f"""You are a research assistant reviewing a user's research idea and their root academic paper.
+            with st.status("Analysing your research context...", expanded=True) as status:
+                st.write("Reading your research idea...")
+                llm = get_llm()
+                st.write("Retrieving key excerpts from root paper...")
+                root_chunks = search_similar(
+                    st.session_state.research_idea, k=6,
+                    session_id=st.session_state.session_id
+                )
+                context = "\n\n".join([c.page_content for c in root_chunks])
+                st.write("Building research context summary...")
+                response = call_llm_safe(llm, f"""You are a research assistant reviewing a user's research idea and their root academic paper.
 
 Research idea provided by the user:
 "{st.session_state.research_idea}"
@@ -410,8 +479,9 @@ Write a clear, specific research context summary in 4–5 sentences covering:
 
 Write in academic prose. Be specific. Do not use bullet points.
 """)
-            understanding = response.content if hasattr(response, "content") else str(response)
-            st.session_state.context_understanding = understanding.strip()
+                understanding = response.content if hasattr(response, "content") else str(response)
+                st.session_state.context_understanding = understanding.strip()
+                status.update(label="Context ready!", state="complete")
         except Exception as e:
             st.error(f"Could not generate research context — check your GROQ_API_KEY. Error: {e}")
             st.stop()
@@ -475,18 +545,37 @@ elif st.session_state.screen == "validate":
         if candidate_file and candidate_file.name not in st.session_state.processed_candidates:
             tmp_path = None
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(candidate_file.read())
-                    tmp_path = tmp.name
+                with st.status(f"Analysing {candidate_file.name}...", expanded=True) as status:
+                    st.write("Parsing PDF content...")
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(candidate_file.read())
+                        tmp_path = tmp.name
+                    chunks = load_and_split(tmp_path)
 
-                loading_animation([
-                    "Parsing paper content...",
-                    "Ranking chunks by semantic relevance...",
-                    "Consulting LitMap intelligence...",
-                    "Generating verdict and reasoning..."
-                ], delay=0.7)
+                    st.write("Ranking chunks by semantic relevance...")
+                    top_chunks, confidence = get_top_chunks_by_similarity(
+                        st.session_state.research_idea, chunks, k=6
+                    )
 
-                chunks = load_and_split(tmp_path)
+                    st.write("Running LLM relevance check...")
+                    try:
+                        full_verdict_text = check_relevance(
+                            st.session_state.research_idea,
+                            candidate_file.name,
+                            top_chunks
+                        )
+                    except Exception as e:
+                        st.error(f"LLM relevance check failed: {e}")
+                        st.stop()
+
+                    st.write("Generating devil's advocate counter-argument...")
+                    counter_reason = check_counter_relevance(
+                        st.session_state.research_idea,
+                        candidate_file.name,
+                        top_chunks
+                    )
+
+                    status.update(label="Analysis complete!", state="complete")
 
             except Exception as e:
                 st.error(f"Failed to parse paper: {e}")
@@ -495,22 +584,6 @@ elif st.session_state.screen == "validate":
                 if tmp_path and os.path.exists(tmp_path):
                     os.unlink(tmp_path)
 
-            # Fix 1: use semantically top-ranked chunks from the candidate paper
-            # instead of blindly taking the first 5
-            top_chunks, confidence = get_top_chunks_by_similarity(
-                st.session_state.research_idea, chunks, k=6
-            )
-
-            try:
-                full_verdict_text = check_relevance(
-                    st.session_state.research_idea,
-                    candidate_file.name,
-                    top_chunks
-                )
-            except Exception as e:
-                st.error(f"LLM relevance check failed: {e}")
-                st.stop()
-
             verdict, reason = parse_verdict(full_verdict_text)
 
             st.session_state.processed_candidates.add(candidate_file.name)
@@ -518,7 +591,8 @@ elif st.session_state.screen == "validate":
                 "name": candidate_file.name,
                 "verdict": verdict,
                 "reason": reason,
-                "confidence": confidence,   # Fix 2: store for display
+                "counter_reason": counter_reason,
+                "confidence": confidence,
                 "chunks": chunks,
             })
             st.rerun()
@@ -548,6 +622,13 @@ elif st.session_state.screen == "validate":
             </div>
             """, unsafe_allow_html=True)
 
+            if paper.get("counter_reason"):
+                with st.expander("🔍 Why you might NOT include this paper"):
+                    st.markdown(
+                        f'<div style="color:#fbbf24;font-size:0.85rem;line-height:1.65;">{paper["counter_reason"]}</div>',
+                        unsafe_allow_html=True
+                    )
+
             btn_c1, btn_c2, _ = st.columns([1, 1, 4])
             with btn_c1:
                 if st.button("✅ Accept", key=f"accept_{i}"):
@@ -560,7 +641,7 @@ elif st.session_state.screen == "validate":
 
         if pending_action == "accept" and pending_action_idx is not None:
             paper = st.session_state.pending_papers[pending_action_idx]
-            store_chunks(paper["chunks"], paper["name"])
+            store_chunks(paper["chunks"], paper["name"], st.session_state.session_id)
             st.session_state.accepted_papers.append(paper["name"])
             st.session_state.pending_papers.pop(pending_action_idx)
             st.toast(f"✅ Accepted: {paper['name']}", icon="✅")
@@ -572,6 +653,42 @@ elif st.session_state.screen == "validate":
             st.session_state.pending_papers.pop(pending_action_idx)
             st.toast(f"❌ Rejected: {paper['name']}", icon="❌")
             st.rerun()
+
+    # ── Citation Network Suggestions ─────────────────────────────────────────
+    if len(st.session_state.accepted_papers) >= 2:
+        with st.expander("💡 Papers from Citation Network (Semantic Scholar)"):
+            if not st.session_state.suggested_papers:
+                with st.spinner("Fetching citation network..."):
+                    try:
+                        client = SemanticScholarClient()
+                        llm = get_llm()
+                        suggestions = client.suggest_papers(
+                            st.session_state.root_paper_name,
+                            st.session_state.accepted_papers,
+                            st.session_state.research_idea,
+                            llm
+                        )
+                        st.session_state.suggested_papers = suggestions
+                    except Exception:
+                        st.session_state.suggested_papers = []
+
+            if st.session_state.suggested_papers:
+                st.markdown(
+                    '<div style="color:#6b7280;font-size:0.8rem;margin-bottom:12px;">'
+                    'Papers from the citation network of your root paper. Download and upload to validate them.</div>',
+                    unsafe_allow_html=True
+                )
+                for s in st.session_state.suggested_papers:
+                    st.markdown(f"""
+                    <div class="suggestion-card">
+                        <div class="suggestion-title">📄 {s['title']}</div>
+                        <div class="suggestion-year">{s['year']}</div>
+                        <div class="suggestion-relevance">✨ {s['relevance_summary']}</div>
+                        <div class="suggestion-abstract">{s['abstract']}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("Could not find this paper in Semantic Scholar, or no related papers were found.")
 
     # ── Accepted / Rejected ───────────────────────────────────────────────────
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
@@ -623,45 +740,37 @@ elif st.session_state.screen == "review":
 
     if not st.session_state.literature_review:
 
-        loading_animation([
-            "Gathering accepted papers...",
-            "Retrieving key excerpts per paper...",
-            "Balancing context across sources...",
-            "Identifying thematic connections...",
-            "Drafting literature review...",
-            "Generating title...",
-            "Computing retrieval quality...",
-            "Finalising document..."
-        ], delay=1.0)
-
         try:
-            llm = get_llm()
+            with st.status("Generating your literature review...", expanded=True) as status:
+                llm = get_llm()
+                sid = st.session_state.session_id
 
-            # Fix 3 + 4: retrieve balanced chunks per paper (not a flat top-10 dump)
-            # Each paper gets its own context section so the LLM can write about all of them
-            paper_sections = []
-            for paper in st.session_state.accepted_papers:
-                chunks = search_similar_filtered(st.session_state.research_idea, paper, k=4)
-                if chunks:
-                    section_text = "\n\n".join([c.page_content for c in chunks])
-                    paper_sections.append(f"[Source: {paper}]\n{section_text}")
+                st.write("Retrieving balanced excerpts per paper...")
+                paper_sections = []
+                for paper in st.session_state.accepted_papers:
+                    chunks = search_similar_filtered(
+                        st.session_state.research_idea, paper, k=4, session_id=sid
+                    )
+                    if chunks:
+                        section_text = "\n\n".join([c.page_content for c in chunks])
+                        paper_sections.append(f"[Source: {paper}]\n{section_text}")
 
-            context = "\n\n---\n\n".join(paper_sections) if paper_sections else "No excerpts available."
+                context = "\n\n---\n\n".join(paper_sections) if paper_sections else "No excerpts available."
 
-            # Generate title
-            title_response = call_llm_safe(
-                llm,
-                f"Generate a concise academic title (maximum 12 words) for a literature review on this topic: "
-                f"{st.session_state.research_idea}. Return only the title, nothing else."
-            )
-            st.session_state.review_title = (
-                title_response.content.strip()
-                if hasattr(title_response, "content")
-                else str(title_response).strip()
-            )
+                st.write("Generating title...")
+                title_response = call_llm_safe(
+                    llm,
+                    f"Generate a concise academic title (maximum 12 words) for a literature review on this topic: "
+                    f"{st.session_state.research_idea}. Return only the title, nothing else."
+                )
+                st.session_state.review_title = (
+                    title_response.content.strip()
+                    if hasattr(title_response, "content")
+                    else str(title_response).strip()
+                )
 
-            # Generate review — prompt now receives labelled per-paper sections
-            review_response = call_llm_safe(llm, f"""
+                st.write("Drafting literature review...")
+                review_response = call_llm_safe(llm, f"""
 You are an academic research assistant. Write a structured literature review.
 
 Research idea: {st.session_state.research_idea}
@@ -678,31 +787,58 @@ Structure:
 
 Every accepted paper must be discussed. Use clear academic language.
 """)
-            raw_review = (
-                review_response.content
-                if hasattr(review_response, "content")
-                else str(review_response)
-            )
-            st.session_state.literature_review = raw_review
+                raw_review = (
+                    review_response.content
+                    if hasattr(review_response, "content")
+                    else str(review_response)
+                )
+                st.session_state.literature_review = raw_review
+
+                st.write("Extracting synthesis matrix...")
+                try:
+                    matrix = build_synthesis_matrix(
+                        llm,
+                        st.session_state.accepted_papers,
+                        search_similar_filtered,
+                        st.session_state.research_idea,
+                        sid
+                    )
+                    st.session_state.synthesis_matrix = matrix
+                except Exception:
+                    st.session_state.synthesis_matrix = None
+
+                st.write("Detecting contradictions and consensus...")
+                try:
+                    if st.session_state.synthesis_matrix and len(st.session_state.synthesis_matrix) >= 2:
+                        st.session_state.contradiction_analysis = detect_contradictions(
+                            llm, st.session_state.synthesis_matrix, st.session_state.research_idea
+                        )
+                except Exception:
+                    st.session_state.contradiction_analysis = ""
+
+                st.write("Computing retrieval quality metrics...")
+                try:
+                    def _search_fn(q, p, k):
+                        return search_similar_filtered(q, p, k=k, session_id=sid)
+
+                    paper_stats, overall_confidence = compute_review_quality(
+                        st.session_state.research_idea,
+                        st.session_state.accepted_papers,
+                        _search_fn,
+                        k_per_paper=4
+                    )
+                    st.session_state.review_quality = {
+                        "paper_stats": paper_stats,
+                        "overall": overall_confidence,
+                    }
+                except Exception:
+                    st.session_state.review_quality = None
+
+                status.update(label="Literature review ready!", state="complete")
 
         except Exception as e:
             st.error(f"Literature review generation failed: {e}. Please try again.")
             st.stop()
-
-        # Fix 2: compute retrieval quality metrics for the quality panel
-        try:
-            paper_stats, overall_confidence = compute_review_quality(
-                st.session_state.research_idea,
-                st.session_state.accepted_papers,
-                search_similar_filtered,
-                k_per_paper=4
-            )
-            st.session_state.review_quality = {
-                "paper_stats": paper_stats,
-                "overall": overall_confidence,
-            }
-        except Exception:
-            st.session_state.review_quality = None   # non-fatal — skip panel
 
         st.rerun()
 
@@ -720,7 +856,47 @@ Every accepted paper must be discussed. Use clear academic language.
         </div>
         """, unsafe_allow_html=True)
 
-        # Fix 2: Retrieval Quality panel
+        # ── Synthesis Matrix ──────────────────────────────────────────────────
+        matrix = st.session_state.synthesis_matrix
+        if matrix:
+            rows_html = ""
+            for row in matrix:
+                rows_html += f"""
+                <tr>
+                    <td class="matrix-paper-name">{row['paper_title']}</td>
+                    <td>{row['sample_size']}</td>
+                    <td>{row['methodology']}</td>
+                    <td>{row['key_findings']}</td>
+                    <td>{row['limitations']}</td>
+                </tr>
+                """
+            st.markdown(f"""
+            <div class="matrix-panel">
+                <div class="matrix-title">📊 Synthesis Matrix</div>
+                <table class="matrix-table">
+                    <tr>
+                        <th>Paper</th>
+                        <th>Sample Size</th>
+                        <th>Methodology</th>
+                        <th>Key Findings</th>
+                        <th>Limitations</th>
+                    </tr>
+                    {rows_html}
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Contradictions & Consensus ────────────────────────────────────────
+        if st.session_state.contradiction_analysis:
+            debate_html = st.session_state.contradiction_analysis.replace("\n", "<br>")
+            st.markdown(f"""
+            <div class="debate-panel">
+                <div class="debate-title">⚡ Debates & Consensus</div>
+                <div class="debate-body">{debate_html}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── Retrieval Quality ─────────────────────────────────────────────────
         quality = st.session_state.review_quality
         if quality:
             overall = quality["overall"]
@@ -741,7 +917,7 @@ Every accepted paper must be discussed. Use clear academic language.
 
             st.markdown(f"""
             <div class="quality-panel">
-                <div class="quality-title">📊 Retrieval Quality</div>
+                <div class="quality-title">📈 Retrieval Quality</div>
                 <div class="quality-overall" style="color:{overall_col};">
                     Overall Retrieval Confidence: {overall}%
                 </div>
@@ -764,7 +940,8 @@ Every accepted paper must be discussed. Use clear academic language.
             docx_buf = generate_docx(
                 st.session_state.review_title,
                 st.session_state.literature_review,
-                st.session_state.accepted_papers
+                st.session_state.accepted_papers,
+                matrix=st.session_state.synthesis_matrix,
             )
             st.download_button(
                 label="⬇️ Download Word Document",

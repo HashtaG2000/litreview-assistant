@@ -8,4 +8,4 @@ services:
     env_file:
       - .env
     volumes:
-      - ./chroma_store:/app/chroma_store
+      - ./chroma_store:/data/chroma_store

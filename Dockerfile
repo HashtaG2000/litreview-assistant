@@ -5,7 +5,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download the cross-encoder reranker model so cold starts don't fetch it
+RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+
 COPY . .
+
+# Persistent storage mount point for ChromaDB
+RUN mkdir -p /data/chroma_store
 
 EXPOSE 8501
 
