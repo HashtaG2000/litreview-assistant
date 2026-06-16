@@ -1,5 +1,4 @@
 import re
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from core.config import CHUNK_SIZE, CHUNK_OVERLAP
 
 # Maps regex patterns (matched against the first few lines of a page) to section labels.
@@ -23,10 +22,19 @@ class StructureAwareChunker:
     """
 
     def __init__(self, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP):
-        self._splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
+        self._splitter = None  # lazy — avoids loading langchain_text_splitters on startup
+
+    def _get_splitter(self):
+        if self._splitter is None:
+            # Lazy import: langchain_text_splitters transitively loads sentence_transformers.
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+            self._splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self._chunk_size,
+                chunk_overlap=self._chunk_overlap,
+            )
+        return self._splitter
 
     def detect_section(self, text: str) -> str:
         """Return a section label for the given page text."""
@@ -41,10 +49,11 @@ class StructureAwareChunker:
 
     def split(self, documents: list) -> list:
         """Split a list of LangChain Documents and attach 'section' metadata."""
+        splitter = self._get_splitter()
         all_chunks = []
         for doc in documents:
             section = self.detect_section(doc.page_content)
-            chunks = self._splitter.split_documents([doc])
+            chunks = splitter.split_documents([doc])
             for chunk in chunks:
                 chunk.metadata['section'] = section
             all_chunks.extend(chunks)

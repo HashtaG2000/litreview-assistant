@@ -1,10 +1,10 @@
-from langchain_chroma import Chroma
 from core.config import CHROMA_PATH
 from core.embeddings import get_embeddings
 
 
 def store_chunks(chunks: list, paper_title: str, session_id: str = "default") -> None:
     """Embed and persist chunks into the Chroma vector store."""
+    from langchain_chroma import Chroma  # lazy — chromadb transitively loads torch
     embeddings = get_embeddings()
     for chunk in chunks:
         chunk.metadata["paper_title"] = paper_title

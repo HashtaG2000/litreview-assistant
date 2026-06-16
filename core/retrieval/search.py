@@ -1,11 +1,11 @@
-from langchain_chroma import Chroma
 from core.config import CHROMA_PATH
 from core.embeddings import get_embeddings
 from core.retrieval.hybrid import HybridRetriever
 from core.retrieval.reranker import rerank
 
 
-def get_db() -> Chroma:
+def get_db():
+    from langchain_chroma import Chroma  # lazy — chromadb transitively loads torch
     return Chroma(persist_directory=CHROMA_PATH, embedding_function=get_embeddings())
 
 

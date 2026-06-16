@@ -1,13 +1,15 @@
 import os
 import time
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
 from core.config import LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_RETRIES
 
 load_dotenv()
 
 
-def get_llm() -> ChatGroq:
+def get_llm():
+    # Lazy import — langchain_groq transitively pulls in torch on import,
+    # so we defer it until the LLM is first needed (not on app startup).
+    from langchain_groq import ChatGroq
     return ChatGroq(
         model=LLM_MODEL,
         api_key=os.getenv("GROQ_API_KEY"),
@@ -15,7 +17,7 @@ def get_llm() -> ChatGroq:
     )
 
 
-def call_llm_safe(llm: ChatGroq, prompt: str, max_retries: int = LLM_MAX_RETRIES):
+def call_llm_safe(llm, prompt: str, max_retries: int = LLM_MAX_RETRIES):
     """Invoke the LLM with exponential-backoff retry (1 s → 2 s → 4 s)."""
     last_err = None
     for attempt in range(max_retries):
